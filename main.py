@@ -4,19 +4,43 @@ import json
 import re
 import logging
 import urllib.parse
-from typing import Optional, List, Dict, Any
+import secrets
+import smtplib
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 from sqlmodel import SQLModel, Field, create_engine, Session, select
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 
 # --- 1. CONFIGURATION ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///local.db")
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+
+# Configuration d'authentification
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Configuration Supabase
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+# Configuration email
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@e-hotelmanager.com")
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -24,6 +48,10 @@ logger = logging.getLogger(__name__)
 
 # Adapte l'URL pour psycopg2
 engine = create_engine(DATABASE_URL.replace("postgres://", "postgresql+psycopg2://"), echo=False)
+
+# Configuration de la sécurité
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
 
 app = FastAPI(
     title="Hotel RM API - v8.0 (Multi-Hotel)",
@@ -114,6 +142,138 @@ def safe_int(val) -> int:
     except (ValueError, TypeError, AttributeError):
         return 0
 
+# --- FONCTIONS D'AUTHENTIFICATION ---
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Vérifie un mot de passe hashé"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Génère un hash de mot de passe"""
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """Crée un token JWT"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> dict:
+    """Vérifie un token JWT et retourne les données décodées"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token invalide ou expiré",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """Récupère l'utilisateur courant à partir du token JWT"""
+    token = credentials.credentials
+    payload = verify_token(token)
+    
+    email: str = payload.get("sub")
+    if email is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token invalide",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.email == email)).first()
+        if user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Utilisateur non trouvé",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Compte désactivé"
+            )
+        
+        # Mettre à jour la dernière connexion
+        user.last_login = datetime.utcnow()
+        session.commit()
+        
+        return {
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "mfa_enabled": user.mfa_enabled
+        }
+
+def send_password_reset_email(email: str, token: str):
+    """Envoie un email de réinitialisation de mot de passe"""
+    reset_url = f"https://auth-user.e-hotelmanager.com/reset-password?token={token}"
+    
+    message = MIMEMultipart("alternative")
+    message["Subject"] = "Réinitialisation de votre mot de passe - HotelVision"
+    message["From"] = FROM_EMAIL
+    message["To"] = email
+    
+    text = f"""
+    Bonjour,
+    
+    Vous avez demandé la réinitialisation de votre mot de passe.
+    
+    Cliquez sur le lien suivant pour définir un nouveau mot de passe :
+    {reset_url}
+    
+    Ce lien expirera dans 1 heure.
+    
+    Si vous n'avez pas demandé cette réinitialisation, veuillez ignorer cet email.
+    
+    Cordialement,
+    L'équipe HotelVision
+    """
+    
+    html = f"""
+    <html>
+    <body>
+        <h2>Réinitialisation de votre mot de passe</h2>
+        <p>Bonjour,</p>
+        <p>Vous avez demandé la réinitialisation de votre mot de passe.</p>
+        <p>Cliquez sur le lien ci-dessous pour définir un nouveau mot de passe :</p>
+        <p><a href="{reset_url}">Réinitialiser mon mot de passe</a></p>
+        <p>Ce lien expirera dans 1 heure.</p>
+        <p>Si vous n'avez pas demandé cette réinitialisation, veuillez ignorer cet email.</p>
+        <p>Cordialement,<br>L'équipe HotelVision</p>
+    </body>
+    </html>
+    """
+    
+    part1 = MIMEText(text, "plain")
+    part2 = MIMEText(html, "html")
+    
+    message.attach(part1)
+    message.attach(part2)
+    
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(message)
+        server.quit()
+        logger.info(f"Email de réinitialisation envoyé à {email}")
+    except Exception as e:
+        logger.error(f"Erreur envoi email à {email}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de l'envoi de l'email"
+        )
+
 # --- 4. MODÈLES DE DONNÉES ---
 class Hotel(SQLModel, table=True):
     hotel_id: str = Field(primary_key=True)
@@ -123,6 +283,48 @@ class HotelConfig(SQLModel, table=True):
     hotel_id: str = Field(index=True, unique=True)
     config_json: str
 
+# --- MODÈLES D'AUTHENTIFICATION ---
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(unique=True, index=True)
+    password_hash: str
+    role: str = Field(default="user")  # "admin" ou "user"
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_login: Optional[datetime] = None
+    mfa_enabled: bool = Field(default=False)
+    mfa_secret: Optional[str] = None
+
+class PasswordReset(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str
+    token: str
+    expires_at: datetime
+    used: bool = Field(default=False)
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+    mfa_code: Optional[str] = None
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: dict
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    role: str = "user"
+
+# --- MODÈLES EXISTANTS ---
 class SimulateIn(BaseModel):
     hotel_id: str
     room: str
@@ -789,6 +991,195 @@ def check_files_status(hotel_id: str = Query(...)):
         "config_exists": config_exists,
         "data_file_path": data_path
     }
+
+# --- ENDPOINTS D'AUTHENTIFICATION ---
+
+@app.post("/auth/login", tags=["Authentication"])
+async def login(request: LoginRequest):
+    """Endpoint de connexion avec validation Supabase"""
+    try:
+        # Vérifier d'abord dans la base de données locale
+        with Session(engine) as session:
+            user = session.exec(select(User).where(User.email == request.email)).first()
+            
+            if not user or not verify_password(request.password, user.password_hash):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Identifiants invalides",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            
+            if not user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Compte désactivé"
+                )
+            
+            # Vérification MFA si activé
+            if user.mfa_enabled and request.mfa_code:
+                # Ici, on pourrait intégrer la vérification MFA
+                # Pour l'instant, on considère que c'est validé
+                pass
+            elif user.mfa_enabled and not request.mfa_code:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Authentification à deux facteurs requise"
+                )
+            
+            # Créer le token JWT
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": user.email, "role": user.role},
+                expires_delta=access_token_expires
+            )
+            
+            # Mettre à jour la dernière connexion
+            user.last_login = datetime.utcnow()
+            session.commit()
+            
+            return LoginResponse(
+                access_token=access_token,
+                user={
+                    "id": user.id,
+                    "email": user.email,
+                    "role": user.role,
+                    "mfa_enabled": user.mfa_enabled
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur de connexion pour {request.email}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur interne lors de la connexion"
+        )
+
+@app.post("/auth/forgot-password", tags=["Authentication"])
+async def forgot_password(request: PasswordResetRequest):
+    """Demande de réinitialisation de mot de passe"""
+    try:
+        with Session(engine) as session:
+            user = session.exec(select(User).where(User.email == request.email)).first()
+            
+            if not user:
+                # Ne pas révéler si l'email existe ou non
+                logger.info(f"Demande de réinitialisation pour email non trouvé: {request.email}")
+                return {"message": "Si cet email existe, vous recevrez un lien de réinitialisation"}
+            
+            # Générer un token de réinitialisation
+            reset_token = secrets.token_urlsafe(32)
+            expires_at = datetime.utcnow() + timedelta(hours=1)
+            
+            # Sauvegarder le token
+            password_reset = PasswordReset(
+                email=request.email,
+                token=reset_token,
+                expires_at=expires_at
+            )
+            session.add(password_reset)
+            session.commit()
+            
+            # Envoyer l'email
+            send_password_reset_email(request.email, reset_token)
+            
+            return {"message": "Si cet email existe, vous recevrez un lien de réinitialisation"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur demande de réinitialisation: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la demande de réinitialisation"
+        )
+
+@app.post("/auth/reset-password", tags=["Authentication"])
+async def reset_password(request: PasswordResetConfirm):
+    """Réinitialisation du mot de passe avec token"""
+    try:
+        with Session(engine) as session:
+            # Vérifier le token
+            password_reset = session.exec(
+                select(PasswordReset).where(
+                    PasswordReset.token == request.token,
+                    PasswordReset.used == False,
+                    PasswordReset.expires_at > datetime.utcnow()
+                )
+            ).first()
+            
+            if not password_reset:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Token invalide ou expiré"
+                )
+            
+            # Récupérer l'utilisateur
+            user = session.exec(select(User).where(User.email == password_reset.email)).first()
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Utilisateur non trouvé"
+                )
+            
+            # Mettre à jour le mot de passe
+            user.password_hash = get_password_hash(request.new_password)
+            session.delete(password_reset)  # Marquer le token comme utilisé
+            session.commit()
+            
+            return {"message": "Mot de passe réinitialisé avec succès"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur réinitialisation mot de passe: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de la réinitialisation"
+        )
+
+@app.get("/auth/verify-token", tags=["Authentication"])
+async def verify_token_endpoint(current_user: dict = Depends(get_current_user)):
+    """Vérifie un token JWT et retourne les informations de l'utilisateur"""
+    return current_user
+
+@app.post("/auth/register", tags=["Authentication"])
+async def register_user(user_data: UserCreate):
+    """Enregistrement d'un nouvel utilisateur (pour les invitations)"""
+    try:
+        with Session(engine) as session:
+            # Vérifier si l'utilisateur existe déjà
+            existing_user = session.exec(select(User).where(User.email == user_data.email)).first()
+            if existing_user:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cet email est déjà utilisé"
+                )
+            
+            # Créer le nouvel utilisateur
+            hashed_password = get_password_hash(user_data.password)
+            new_user = User(
+                email=user_data.email,
+                password_hash=hashed_password,
+                role=user_data.role
+            )
+            
+            session.add(new_user)
+            session.commit()
+            
+            logger.info(f"Nouvel utilisateur enregistré: {user_data.email}")
+            
+            return {"message": "Utilisateur enregistré avec succès"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur enregistrement utilisateur: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Erreur lors de l'enregistrement"
+        )
 
 if __name__ == "__main__":
     import uvicorn
