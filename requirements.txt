@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+psycopg2-binary
+pandas
+openpyxl
+python-multipart
+aiofiles
+python-dotenv
