@@ -328,6 +328,13 @@
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
+    // Configuration
+    const API_URL = 'https://api-folkestone.e-hotelmanager.com';
+    const AUTH_PORTAL = 'https://auth-user.e-hotelmanager.com';
+    
+    // Vérifier l'authentification au chargement de la page
+    checkAuth();
+    
     // Initialisation de Vanta.js pour l'arrière-plan
     VANTA.NET({
         el: "#vanta-bg",
@@ -338,8 +345,91 @@ document.addEventListener('DOMContentLoaded', () => {
         spacing: 15
     });
 
-    const API_URL = 'https://api-folkestone.e-hotelmanager.com';
     let hotelData = {}, hotelConfig = {}, currentSimulationData = null;
+
+    // Fonctions d'authentification
+    async function checkAuth() {
+        const token = localStorage.getItem('auth_token');
+        const userRole = localStorage.getItem('user_role');
+        const userEmail = localStorage.getItem('user_email');
+        
+        if (!token || userRole !== 'user') {
+            // Rediriger vers le portail d'authentification utilisateur
+            window.location.href = AUTH_PORTAL;
+            return;
+        }
+        
+        // Vérifier la validité du token
+        try {
+            const response = await fetch(`${API_URL}/auth/verify-token`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+            
+            if (!response.ok) {
+                // Token invalide, rediriger vers le portail d'authentification
+                localStorage.removeItem('auth_token');
+                localStorage.removeItem('user_role');
+                localStorage.removeItem('user_email');
+                window.location.href = AUTH_PORTAL;
+                return;
+            }
+            
+            // Mettre à jour l'affichage utilisateur
+            updateUserDisplay(userEmail);
+            
+        } catch (error) {
+            console.error('Erreur vérification token:', error);
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_role');
+            localStorage.removeItem('user_email');
+            window.location.href = AUTH_PORTAL;
+        }
+    }
+
+    function updateUserDisplay(userEmail) {
+        // Mettre à jour l'affichage avec les informations utilisateur
+        console.log('Utilisateur connecté:', userEmail);
+        // Ici vous pouvez ajouter la logique pour afficher le nom d'utilisateur, etc.
+    }
+
+    function logout() {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('user_role');
+        localStorage.removeItem('user_email');
+        window.location.href = AUTH_PORTAL;
+    }
+
+    // Fonctions API avec authentification
+    async function apiRequest(url, options = {}) {
+        const token = localStorage.getItem('auth_token');
+        
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers
+        };
+        
+        if (token) {
+            headers['Authorization'] = `Bearer ${token}`;
+        }
+        
+        const response = await fetch(url, {
+            ...options,
+            headers
+        });
+        
+        // Si le token est expiré, rediriger vers le portail d'authentification
+        if (response.status === 401) {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_role');
+            localStorage.removeItem('user_email');
+            window.location.href = AUTH_PORTAL;
+            return;
+        }
+        
+        return response;
+    }
 
     const DOMElements = {
         hotelIdSelect: document.getElementById('hotelId'),
@@ -397,7 +487,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const fetchHotels = async () => {
         try {
-            const res = await fetch(`${API_URL}/hotels`);
+            const res = await apiRequest(`${API_URL}/hotels`);
             if (!res.ok) throw new Error('Impossible de charger les hôtels.');
             const hotels = await res.json();
             
@@ -427,11 +517,11 @@ document.addEventListener('DOMContentLoaded', () => {
         
         try {
             const [dataRes, configRes] = await Promise.all([
-                fetch(`${API_URL}/data?hotel_id=${encodeURIComponent(hotelId)}`),
-                fetch(`${API_URL}/config?hotel_id=${encodeURIComponent(hotelId)}`)
+                apiRequest(`${API_URL}/data?hotel_id=${encodeURIComponent(hotelId)}`),
+                apiRequest(`${API_URL}/config?hotel_id=${encodeURIComponent(hotelId)}`)
             ]);
             
-            if (!dataRes.ok) throw new Error('Données introuvables');
+            if (!dataRes.ok) throw new Error('Données introuvales');
             if (!configRes.ok) throw new Error('Configuration introuvable');
             
             const data = await dataRes.json();
@@ -520,7 +610,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 partner_name: partner || ''
             });
             
-            const res = await fetch(`${API_URL}/plans/partner?${params}`);
+            const res = await apiRequest(`${API_URL}/plans/partner?${params}`);
             if (!res.ok) throw new Error('Erreur chargement plans');
             
             const data = await res.json();
@@ -574,7 +664,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         showSpinner();
         try {
-            const res = await fetch(`${API_URL}/simulate`, {
+            const res = await apiRequest(`${API_URL}/simulate`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)
@@ -635,7 +725,7 @@ document.addEventListener('DOMContentLoaded', () => {
         
         showSpinner();
         try {
-            const res = await fetch(`${API_URL}/availability`, {
+            const res = await apiRequest(`${API_URL}/availability`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload)

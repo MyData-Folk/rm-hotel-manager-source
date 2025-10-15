@@ -338,6 +338,7 @@
     <script>
         // Configuration
         const API_BASE = 'https://api-folkestone.e-hotelmanager.com';
+        const AUTH_PORTAL = 'https://auth-admin.e-hotelmanager.com';
         
         // Éléments DOM
         const elements = {
@@ -367,18 +368,113 @@
             detailedStatus: document.getElementById('detailedStatus'),
             
             // Messages
-            messageContainer: document.getElementById('messageContainer')
+            messageContainer: document.getElementById('messageContainer'),
+            
+            // Authentification
+            userDisplay: document.querySelector('.hidden.md\\:flex.items-center.gap-2')
         };
 
         // Initialisation
         document.addEventListener('DOMContentLoaded', function() {
             feather.replace();
+            checkAuth();
             setupNavigation();
             loadHotels();
             setupEventListeners();
             checkSystemStatus();
             setupFileInputs();
         });
+
+        // Fonctions d'authentification
+        async function checkAuth() {
+            const token = localStorage.getItem('auth_token');
+            const userRole = localStorage.getItem('user_role');
+            const userEmail = localStorage.getItem('user_email');
+            
+            if (!token || userRole !== 'admin') {
+                // Rediriger vers le portail d'authentification admin
+                window.location.href = AUTH_PORTAL;
+                return;
+            }
+            
+            // Vérifier la validité du token
+            try {
+                const response = await fetch(`${API_BASE}/auth/verify-token`, {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                
+                if (!response.ok) {
+                    // Token invalide, rediriger vers le portail d'authentification
+                    localStorage.removeItem('auth_token');
+                    localStorage.removeItem('user_role');
+                    localStorage.removeItem('user_email');
+                    window.location.href = AUTH_PORTAL;
+                    return;
+                }
+                
+                // Mettre à jour l'affichage utilisateur
+                updateUserDisplay(userEmail);
+                
+            } catch (error) {
+                console.error('Erreur vérification token:', error);
+                localStorage.removeItem('auth_token');
+                localStorage.removeItem('user_role');
+                localStorage.removeItem('user_email');
+                window.location.href = AUTH_PORTAL;
+            }
+        }
+
+        function updateUserDisplay(email) {
+            if (elements.userDisplay) {
+                elements.userDisplay.innerHTML = `
+                    <i data-feather="user" class="w-5 h-5"></i>
+                    <span>${email || 'Administrateur'}</span>
+                    <button onclick="logout()" class="ml-2 p-1 rounded-full hover:bg-white/10">
+                        <i data-feather="log-out" class="w-4 h-4"></i>
+                    </button>
+                `;
+                feather.replace();
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem('auth_token');
+            localStorage.removeItem('user_role');
+            localStorage.removeItem('user_email');
+            window.location.href = AUTH_PORTAL;
+        }
+
+        // Fonctions API avec authentification
+        async function apiRequest(url, options = {}) {
+            const token = localStorage.getItem('auth_token');
+            
+            const headers = {
+                'Content-Type': 'application/json',
+                ...options.headers
+            };
+            
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+            
+            const response = await fetch(url, {
+                ...options,
+                headers
+            });
+            
+            // Si le token est expiré, rediriger vers le portail d'authentification
+            if (response.status === 401) {
+                localStorage.removeItem('auth_token');
+                localStorage.removeItem('user_role');
+                localStorage.removeItem('user_email');
+                window.location.href = AUTH_PORTAL;
+                return;
+            }
+            
+            return response;
+        }
 
         function setupNavigation() {
             elements.navTabs.forEach(tab => {
@@ -435,7 +531,7 @@
                     </div>
                 `;
                 
-                const response = await fetch(`${API_BASE}/hotels`);
+                const response = await apiRequest(`${API_BASE}/hotels`);
                 const hotels = await response.json();
                 
                 updateHotelsList(hotels);
@@ -527,7 +623,7 @@
             `;
             
             try {
-                const response = await fetch(`${API_BASE}/hotels?hotel_id=${encodeURIComponent(hotelId)}`, {
+                const response = await apiRequest(`${API_BASE}/hotels?hotel_id=${encodeURIComponent(hotelId)}`, {
                     method: 'POST'
                 });
                 
@@ -559,7 +655,7 @@
             }
             
             try {
-                const response = await fetch(`${API_BASE}/hotels/${encodeURIComponent(hotelId)}`, {
+                const response = await apiRequest(`${API_BASE}/hotels/${encodeURIComponent(hotelId)}`, {
                     method: 'DELETE'
                 });
                 
@@ -659,7 +755,7 @@
         async function checkSystemStatus() {
             try {
                 // Vérifier le statut de l'API
-                const healthResponse = await fetch(`${API_BASE}/health`);
+                const healthResponse = await apiRequest(`${API_BASE}/health`);
                 if (healthResponse.ok) {
                     const health = await healthResponse.json();
                     elements.apiStatus.textContent = 'En ligne';
@@ -671,7 +767,7 @@
                 }
                 
                 // Vérifier le statut détaillé des hôtels
-                const hotelsResponse = await fetch(`${API_BASE}/hotels`);
+                const hotelsResponse = await apiRequest(`${API_BASE}/hotels`);
                 const hotels = await hotelsResponse.json();
                 
                 elements.hotelsCount.textContent = hotels.length;
@@ -686,7 +782,7 @@
                     `;
                 } else {
                     for (const hotel of hotels) {
-                        const statusResponse = await fetch(`${API_BASE}/files/status?hotel_id=${encodeURIComponent(hotel)}`);
+                        const statusResponse = await apiRequest(`${API_BASE}/files/status?hotel_id=${encodeURIComponent(hotel)}`);
                         const status = await statusResponse.json();
                         
                         detailedHtml += `
@@ -734,7 +830,7 @@
 
         async function testHotel(hotelId) {
             try {
-                const response = await fetch(`${API_BASE}/data?hotel_id=${encodeURIComponent(hotelId)}`);
+                const response = await apiRequest(`${API_BASE}/data?hotel_id=${encodeURIComponent(hotelId)}`);
                 if (response.ok) {
                     showMessage(`Hôtel "${hotelId}" testé avec succès`, 'success');
                 } else {
